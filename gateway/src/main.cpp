@@ -19,7 +19,7 @@ void print_help() {
     Serial.println("\n=== Comandos ===");
     Serial.println("  h/?  - Esta ajuda");
     Serial.println("  l    - Listar sensores pareados");
-    Serial.println("  p    - Iniciar modo pareamento (60s)");
+    Serial.printf("  p    - Iniciar modo pareamento (%lus)\n", PAIRING_WINDOW_MS / 1000);
     Serial.println("  c    - Limpar TODOS os sensores");
     Serial.println("  r    - Reiniciar");
     Serial.println("  b    - Broadcast re-register para Bridge");
@@ -87,9 +87,9 @@ void handle_serial() {
             Serial.printf("Bridge: %s:%d (%s)\n", 
                           bridge_client_get_host(), bridge_client_get_port(),
                           bridge_client_is_discovered() ? "descoberto" : "não descoberto");
-            Serial.printf("WiFi: %s (RSSI: %d dBm)\n",
+            Serial.printf("WiFi: %s ch=%d (RSSI: %d dBm)\n",
                           WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "desconectado",
-                          WiFi.RSSI());
+                          WiFi.channel(), WiFi.RSSI());
             Serial.printf("Pareamento: %s\n", espnow_is_pairing() ? "ATIVO" : "inativo");
             Serial.printf("========================\n\n");
             break;

@@ -23,6 +23,7 @@ typedef struct {
         struct { uint8_t contact_state; uint8_t tamper; } contact;
         struct { uint8_t motion_state; uint8_t occupancy_duration; } motion;
         struct { uint16_t gas_level; uint8_t alarm; } gas;
+        struct { float temperature; float humidity; uint16_t gas_level; uint8_t alarm; } dht_gas;
         struct { uint8_t rain_level; uint8_t rain_digital; } rain;
         struct { uint16_t level_pct; uint16_t distance_cm; } tank;
     } state;
