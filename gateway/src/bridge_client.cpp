@@ -8,31 +8,78 @@
 #include <ArduinoJson.h>
 #include <EEPROM.h>
 
-static WiFiClient s_wifi;
-static HTTPClient s_http;
 static char s_bridge_host[64] = BRIDGE_HOST_DEFAULT;
 static uint16_t s_bridge_port = BRIDGE_PORT_DEFAULT;
 static bool s_bridge_discovered = false;
 static unsigned long s_last_discovery = 0;
 static unsigned long s_last_heartbeat = 0;
 
+static bool is_valid_host() {
+    if (strcmp(s_bridge_host, "0.0.0.0") == 0) return false;
+    if (strcmp(s_bridge_host, "") == 0) return false;
+    return true;
+}
+
+#define HTTP_MIN_HEAP 16384
+
 static bool http_post(const char *path, const String &body) {
-    String url = "http://" + String(s_bridge_host) + ":" + String(s_bridge_port) + path;
-    s_http.begin(s_wifi, url);
-    s_http.addHeader("Content-Type", "application/json");
-    s_http.setTimeout(5000);
-    
-    int code = s_http.POST(body);
-    bool ok = (code == 200);
-    
+    if (!is_valid_host()) return false;
+    if (ESP.getFreeHeap() < HTTP_MIN_HEAP) {
+        static unsigned long last_warn = 0;
+        if (millis() - last_warn > 10000) {
+            last_warn = millis();
+            Serial.printf("[BRIDGE] Heap too low (%d) for %s\n", ESP.getFreeHeap(), path);
+        }
+        return false;
+    }
+
+    IPAddress ip;
+    if (!ip.fromString(s_bridge_host)) return false;
+
+    WiFiClient wifi;
+    wifi.setTimeout(3000);
+    if (!wifi.connect(ip, s_bridge_port)) {
+        static unsigned long last_warn = 0;
+        if (millis() - last_warn > 30000) {
+            last_warn = millis();
+            Serial.printf("[BRIDGE] TCP connect failed %s:%d (heap=%d)\n",
+                          s_bridge_host, s_bridge_port, ESP.getFreeHeap());
+        }
+        return false;
+    }
+
+    String req = "POST ";
+    req += path;
+    req += " HTTP/1.1\r\nHost: ";
+    req += s_bridge_host;
+    req += "\r\nContent-Type: application/json\r\nContent-Length: ";
+    req += body.length();
+    req += "\r\nConnection: close\r\n\r\n";
+    req += body;
+    wifi.write(req.c_str(), req.length());
+
+    unsigned long deadline = millis() + 3000;
+    String resp;
+    while (millis() < deadline) {
+        if (wifi.available()) {
+            char c = wifi.read();
+            resp += c;
+            if (resp.endsWith("\r\n\r\n") || resp.length() > 1024) break;
+        }
+        delay(1);
+    }
+
+    bool ok = resp.startsWith("HTTP/1.1 200");
     if (!ok) {
         static unsigned long last_warn = 0;
         if (millis() - last_warn > 30000) {
             last_warn = millis();
-            Serial.printf("[BRIDGE] POST %s -> %d\n", path, code);
+            int code_start = resp.indexOf(' ');
+            String code_str = (code_start >= 0) ? resp.substring(code_start + 1, code_start + 4) : "???";
+            Serial.printf("[BRIDGE] POST %s -> %s\n", path, code_str.c_str());
         }
     }
-    s_http.end();
+    wifi.stop();
     return ok;
 }
 
@@ -146,6 +193,7 @@ const char* sensor_type_to_string(uint8_t type) {
         case SENSOR_TYPE_CONTACT: return "contact";
         case SENSOR_TYPE_MOTION: return "occupancy";
         case SENSOR_TYPE_GAS: return "gas";
+        case SENSOR_TYPE_DHT_GAS: return "dht_gas";
         case SENSOR_TYPE_RAIN: return "rain";
         case SENSOR_TYPE_TANK: return "tanque";
         default: return "unknown";
@@ -207,6 +255,12 @@ bool bridge_client_send_state(virtual_sensor_t *sensor) {
         case SENSOR_TYPE_GAS:
             doc["gas_level"] = sensor->state.gas.gas_level;
             doc["alarm"] = sensor->state.gas.alarm;
+            break;
+        case SENSOR_TYPE_DHT_GAS:
+            doc["temperature"] = sensor->state.dht_gas.temperature;
+            doc["humidity"] = sensor->state.dht_gas.humidity;
+            doc["gas_level"] = sensor->state.dht_gas.gas_level;
+            doc["alarm"] = sensor->state.dht_gas.alarm;
             break;
         case SENSOR_TYPE_RAIN:
             doc["rain_level"] = sensor->state.rain.rain_level;

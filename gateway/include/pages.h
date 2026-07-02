@@ -241,7 +241,7 @@ async function enterPairingMode() {
             el.textContent = remaining;
             if (remaining <= 0) exitPairingMode();
         }, 1000);
-        showToast('Modo pareamento iniciado (60s)');
+        showToast('Modo pareamento iniciado (180s)');
     } catch (e) { showToast('Erro: '+e.message, true); }
 }
 

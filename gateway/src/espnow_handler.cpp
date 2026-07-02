@@ -14,83 +14,102 @@ static unsigned long s_rx_count = 0;
 static unsigned long s_ack_count = 0;
 static unsigned long s_crc_errors = 0;
 
+#define PENDING_PAIR_MAX 5
+typedef struct {
+    bool active;
+    uint8_t mac[6];
+    uint8_t sensor_type;
+    uint16_t sequence;
+    char name[32];
+} pending_pair_t;
+static pending_pair_t s_pending_pairs[PENDING_PAIR_MAX];
+
+#define PENDING_STATE_MAX 5
+static uint8_t s_pending_state_slots[PENDING_STATE_MAX];
+static int s_pending_state_head = 0;
+static int s_pending_state_tail = 0;
+
+static void queue_bridge_state(int slot) {
+    int next = (s_pending_state_head + 1) % PENDING_STATE_MAX;
+    if (next == s_pending_state_tail) return;
+    s_pending_state_slots[s_pending_state_head] = slot;
+    s_pending_state_head = next;
+}
+
 static void send_ack(const uint8_t *mac, uint16_t sequence, uint8_t status, uint8_t slot);
 static void send_pair_response(const uint8_t *mac, uint16_t sequence, uint16_t slot);
 
 extern "C" void espnow_recv_cb(uint8_t *mac, uint8_t *data, uint8_t len) {
-    if (len < sizeof(espnow_header_t)) {
-        s_crc_errors++;
-        return;
-    }
-
-    espnow_header_t *header = (espnow_header_t*)data;
-    
-    if (header->version != ESPNOW_PROTOCOL_VERSION) {
+    if (!data || len < 2) {
         s_crc_errors++;
         return;
     }
 
     s_rx_count++;
-    int slot = sensor_registry_find_by_mac(mac);
+    uint8_t msg_type = data[0];
+    char mac_str[18];
+    mac_to_str(mac, mac_str, sizeof(mac_str));
+    Serial.printf("[ESP-NOW] RX msg_type=%d len=%d from=%s pairing=%d\n",
+                  msg_type, len, mac_str, s_pairing_mode);
 
-    switch (header->msg_type) {
+    switch (msg_type) {
         case ESPNOW_MSG_PAIR_REQUEST: {
-            if (!s_pairing_mode) {
-                send_ack(mac, header->sequence, PAIR_STATUS_DENIED, 0xFF);
-                return;
-            }
-            
+            if (len < sizeof(espnow_pair_request_t)) { s_crc_errors++; return; }
+            if (!s_pairing_mode) { Serial.printf("[ESP-NOW] Pair request ignored (not pairing)\n"); return; }
+            if (sensor_registry_find_by_mac(mac) >= 0) return;
+
             espnow_pair_request_t *req = (espnow_pair_request_t*)data;
-            int free_slot = sensor_registry_find_free_slot();
-            
-            if (free_slot < 0) {
-                send_ack(mac, header->sequence, PAIR_STATUS_FULL, 0xFF);
-                return;
+
+            for (int i = 0; i < PENDING_PAIR_MAX; i++) {
+                if (!s_pending_pairs[i].active) {
+                    mac_copy(s_pending_pairs[i].mac, mac);
+                    s_pending_pairs[i].sensor_type = req->sensor_type;
+                    s_pending_pairs[i].sequence = req->sequence;
+                    snprintf(s_pending_pairs[i].name, sizeof(s_pending_pairs[i].name), "%s %d",
+                             (req->sensor_type == SENSOR_TYPE_TEMP_HUM) ? "Temp+Hum" :
+                             (req->sensor_type == SENSOR_TYPE_CONTACT) ? "Contato" :
+                             (req->sensor_type == SENSOR_TYPE_MOTION) ? "Movimento" :
+                             (req->sensor_type == SENSOR_TYPE_GAS) ? "Gas" :
+                             (req->sensor_type == SENSOR_TYPE_DHT_GAS) ? "DHT+Gas" :
+                             (req->sensor_type == SENSOR_TYPE_RAIN) ? "Chuva" : "Tanque",
+                             i + 1);
+                    s_pending_pairs[i].active = true;
+                    break;
+                }
             }
-            
-            char default_name[32];
-            snprintf(default_name, sizeof(default_name), "%s %d", 
-                     (req->sensor_type == SENSOR_TYPE_TEMP_HUM) ? "Temp+Hum" :
-                     (req->sensor_type == SENSOR_TYPE_CONTACT) ? "Contato" :
-                     (req->sensor_type == SENSOR_TYPE_MOTION) ? "Movimento" :
-                     (req->sensor_type == SENSOR_TYPE_GAS) ? "Gas" :
-                     (req->sensor_type == SENSOR_TYPE_RAIN) ? "Chuva" : "Tanque",
-                     free_slot + 1);
-            
-            sensor_registry_add(mac, req->sensor_type, free_slot, default_name);
-            send_pair_response(mac, header->sequence, free_slot);
-            
-            bridge_client_register_sensor(sensor_registry_get(free_slot));
-            
-            Serial.printf("[ESP-NOW] Paired sensor slot %d: %02X:%02X:%02X:%02X:%02X:%02X type=%d\n",
-                          free_slot, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], req->sensor_type);
             break;
         }
-        
-        case ESPNOW_MSG_SENSOR_DATA: {
-            if (slot < 0) {
-                send_ack(mac, header->sequence, PAIR_STATUS_DENIED, 0xFF);
-                return;
-            }
-            
-            sensor_registry_update_state(slot, header, header->payload, header->payload_len);
-            send_ack(mac, header->sequence, PAIR_STATUS_OK, slot);
-            s_ack_count++;
-            
-            bridge_client_send_state(sensor_registry_get(slot));
-            break;
-        }
-        
+
+        case ESPNOW_MSG_SENSOR_DATA:
         case ESPNOW_MSG_HEARTBEAT: {
-            if (slot >= 0) {
-                sensor_registry_get(slot)->last_seen = millis();
-                sensor_registry_get(slot)->online = true;
-                send_ack(mac, header->sequence, PAIR_STATUS_OK, slot);
+            if (len < sizeof(espnow_header_t)) { s_crc_errors++; return; }
+            espnow_header_t *hdr = (espnow_header_t*)data;
+
+            if (hdr->version != ESPNOW_PROTOCOL_VERSION) { s_crc_errors++; return; }
+
+            int slot = sensor_registry_find_by_mac(mac);
+
+            if (msg_type == ESPNOW_MSG_SENSOR_DATA) {
+                if (slot < 0) {
+                    send_ack(mac, hdr->sequence, PAIR_STATUS_DENIED, 0xFF);
+                    return;
+                }
+                sensor_registry_update_state(slot, hdr, hdr->payload, hdr->payload_len);
+                send_ack(mac, hdr->sequence, PAIR_STATUS_OK, slot);
+                s_ack_count++;
+                queue_bridge_state(slot);
+            } else {
+                if (slot >= 0) {
+                    sensor_registry_get(slot)->last_seen = millis();
+                    sensor_registry_get(slot)->online = true;
+                    send_ack(mac, hdr->sequence, PAIR_STATUS_OK, slot);
+                }
             }
             break;
         }
-        
+
         default:
+            s_crc_errors++;
             break;
     }
 }
@@ -124,6 +143,7 @@ void send_pair_response(const uint8_t *mac, uint16_t sequence, uint16_t slot) {
 }
 
 bool espnow_handler_init() {
+    memset(s_pending_pairs, 0, sizeof(s_pending_pairs));
     WiFi.mode(WIFI_STA);
     WiFi.macAddress(s_gateway_mac);
     
@@ -134,11 +154,11 @@ bool espnow_handler_init() {
     
     esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
     esp_now_register_recv_cb(espnow_recv_cb);
-    wifi_set_channel(ESP_NOW_CHANNEL);
     
-    Serial.printf("[ESP-NOW] Initialized on channel %d, MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                  ESP_NOW_CHANNEL, s_gateway_mac[0], s_gateway_mac[1], s_gateway_mac[2],
-                  s_gateway_mac[3], s_gateway_mac[4], s_gateway_mac[5]);
+    Serial.printf("[ESP-NOW] Initialized, MAC: %02X:%02X:%02X:%02X:%02X:%02X WiFi ch=%d\n",
+                  s_gateway_mac[0], s_gateway_mac[1], s_gateway_mac[2],
+                  s_gateway_mac[3], s_gateway_mac[4], s_gateway_mac[5],
+                  WiFi.channel());
     return true;
 }
 
@@ -148,10 +168,43 @@ void espnow_handler_loop() {
         digitalWrite(STATUS_LED_GPIO, HIGH);
         Serial.println("[ESP-NOW] Pairing mode timeout");
     }
-    
+
+    for (int i = 0; i < PENDING_PAIR_MAX; i++) {
+        if (!s_pending_pairs[i].active) continue;
+
+        s_pending_pairs[i].active = false;
+        int free_slot = sensor_registry_find_free_slot();
+
+        if (free_slot < 0) {
+            send_ack(s_pending_pairs[i].mac, s_pending_pairs[i].sequence, PAIR_STATUS_FULL, 0xFF);
+            continue;
+        }
+
+        sensor_registry_add(s_pending_pairs[i].mac, s_pending_pairs[i].sensor_type,
+                            free_slot, s_pending_pairs[i].name);
+        send_pair_response(s_pending_pairs[i].mac, s_pending_pairs[i].sequence, free_slot);
+        if (bridge_client_is_discovered())
+            bridge_client_register_sensor(sensor_registry_get(free_slot));
+
+        Serial.printf("[ESP-NOW] Paired sensor slot %d: %02X:%02X:%02X:%02X:%02X:%02X type=%d\n",
+                      free_slot,
+                      s_pending_pairs[i].mac[0], s_pending_pairs[i].mac[1],
+                      s_pending_pairs[i].mac[2], s_pending_pairs[i].mac[3],
+                      s_pending_pairs[i].mac[4], s_pending_pairs[i].mac[5],
+                      s_pending_pairs[i].sensor_type);
+    }
+
+    while (s_pending_state_tail != s_pending_state_head) {
+        int slot = s_pending_state_slots[s_pending_state_tail];
+        s_pending_state_tail = (s_pending_state_tail + 1) % PENDING_STATE_MAX;
+        virtual_sensor_t *s = sensor_registry_get(slot);
+        if (s && s->paired && bridge_client_is_discovered())
+            bridge_client_send_state(s);
+    }
+
     if (millis() - s_last_heartbeat > HEARTBEAT_INTERVAL_MS) {
         s_last_heartbeat = millis();
-        
+
         for (int i = 0; i < MAX_VIRTUAL_SENSORS; i++) {
             virtual_sensor_t *s = sensor_registry_get(i);
             if (s && s->paired) {
@@ -173,7 +226,7 @@ bool espnow_start_pairing() {
     s_pairing_mode = true;
     s_pairing_start = millis();
     digitalWrite(STATUS_LED_GPIO, LOW);
-    Serial.println("[ESP-NOW] Pairing mode started (60s)");
+    Serial.printf("[ESP-NOW] Pairing mode started (%lus)\n", PAIRING_WINDOW_MS / 1000);
     return true;
 }
 

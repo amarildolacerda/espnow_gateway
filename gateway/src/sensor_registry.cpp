@@ -131,11 +131,18 @@ bool sensor_registry_update_state(int slot, const espnow_header_t *header, const
             }
             break;
         }
-        case SENSOR_TYPE_GAS: {
-            if (payload_len >= sizeof(payload_gas_t)) {
+        case SENSOR_TYPE_GAS:
+        case SENSOR_TYPE_DHT_GAS: {
+            if (payload_len >= sizeof(payload_dht_gas_t)) {
+                payload_dht_gas_t *p = (payload_dht_gas_t*)payload;
+                s->state.dht_gas.temperature = p->temperature;
+                s->state.dht_gas.humidity = p->humidity;
+                s->state.dht_gas.gas_level = p->gas_level;
+                s->state.dht_gas.alarm = p->alarm;
+            } else if (payload_len >= sizeof(payload_gas_t)) {
                 payload_gas_t *p = (payload_gas_t*)payload;
-                s->state.gas.gas_level = p->gas_level;
-                s->state.gas.alarm = p->alarm;
+                s->state.dht_gas.gas_level = p->gas_level;
+                s->state.dht_gas.alarm = p->alarm;
             }
             break;
         }

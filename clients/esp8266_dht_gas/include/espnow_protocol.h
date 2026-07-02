@@ -61,13 +61,6 @@ typedef struct __attribute__((packed)) {
 } payload_gas_t;
 
 typedef struct __attribute__((packed)) {
-    float temperature;
-    float humidity;
-    uint16_t gas_level;
-    uint8_t alarm;
-} payload_dht_gas_t;
-
-typedef struct __attribute__((packed)) {
     uint8_t rain_level;
     uint8_t rain_digital;
 } payload_rain_t;
