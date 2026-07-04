@@ -133,7 +133,10 @@ void setup() {
     espnow_handler_init();
     web_server_init();
     
-    if (bridge_client_discover()) {
+    if (bridge_client_is_discovered()) {
+        bridge_client_register_all();
+        Serial.printf("[%s] Bridge loaded from config, registered sensors\n", TAG);
+    } else if (bridge_client_discover()) {
         bridge_client_register_all();
     } else {
         Serial.printf("[%s] Bridge não descoberto, aguardando...\n", TAG);

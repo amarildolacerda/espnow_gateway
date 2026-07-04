@@ -105,6 +105,11 @@ bool bridge_client_load_config() {
     }
     
     EEPROM.end();
+
+    if (strcmp(s_bridge_host, "0.0.0.0") != 0 && strlen(s_bridge_host) > 0) {
+        s_bridge_discovered = true;
+        Serial.printf("[BRIDGE] Valid host from EEPROM, bridge marked as discovered\n");
+    }
     
     Serial.printf("[BRIDGE] Config loaded: %s:%d\n", s_bridge_host, s_bridge_port);
     return true;
@@ -122,6 +127,7 @@ bool bridge_client_save_config(const char *host, uint16_t port) {
     
     strcpy(s_bridge_host, host);
     s_bridge_port = port;
+    s_bridge_discovered = true;
     
     Serial.printf("[BRIDGE] Config saved: %s:%d\n", host, port);
     return true;
@@ -161,7 +167,12 @@ bool bridge_client_discover() {
                     if (!port) port = BRIDGE_PORT_DEFAULT;
                     
                     if (host && strlen(host) > 0) {
-                        strcpy(s_bridge_host, host);
+                        if (strcmp(host, "0.0.0.0") == 0) {
+                            IPAddress src = udp.remoteIP();
+                            snprintf(s_bridge_host, sizeof(s_bridge_host), "%d.%d.%d.%d", src[0], src[1], src[2], src[3]);
+                        } else {
+                            strcpy(s_bridge_host, host);
+                        }
                         s_bridge_port = port;
                         s_bridge_discovered = true;
                         Serial.printf("[BRIDGE] Discovered: http://%s:%d\n", s_bridge_host, s_bridge_port);
