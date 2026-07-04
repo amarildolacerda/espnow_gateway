@@ -1,7 +1,7 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-#define FW_VERSION "v0.0.13"
+#define FW_VERSION "v0.0.14"
 #define DEVICE_NAME "ESP8266_Gateway"
 
 #define ESP_NOW_CHANNEL 1
