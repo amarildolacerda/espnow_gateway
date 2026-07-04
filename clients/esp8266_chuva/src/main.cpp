@@ -4,7 +4,6 @@
 #include <ArduinoJson.h>
 #include <WiFiManager.h>
 #include <EEPROM.h>
-#include <DHT.h>
 #include <ArduinoOTA.h>
 #include <Updater.h>
 #include <espnow.h>
@@ -12,16 +11,7 @@
 #include "pages.h"
 #include "espnow_protocol.h"
 
-static const char *TAG = "esp8266-dht-gas";
-
-typedef struct __attribute__((packed)) {
-    float temperature;
-    float humidity;
-    uint16_t gas_level;
-    uint8_t alarm;
-} payload_dht_gas_t;
-
-static DHT *s_dht = nullptr;
+static const char *TAG = "esp8266-chuva";
 
 static unsigned long s_last_state_update = 0;
 static unsigned long s_last_telemetry_update = 0;
@@ -40,12 +30,8 @@ static bool s_ack_received = false;
 static bool s_send_pending = false;
 static bool s_espnow_ready = false;
 
-static float s_temperature = 0;
-static float s_humidity = 0;
-static int s_gas_level = 0;
-static bool s_alarm = false;
-static bool s_sensor_error = false;
-static bool s_dht_valid = false;
+static int s_rain_level = 0;
+static int s_rain_digital = HIGH;
 static int s_battery = 100;
 static unsigned long s_start_time = 0;
 static unsigned long s_last_send_ms = 0;
@@ -53,7 +39,6 @@ static unsigned long s_last_send_ms = 0;
 static char s_device_id[32];
 static char s_device_name[48] = DEVICE_NAME;
 
-static int s_dht_pin = DHT_PIN;
 static bool s_wifi_configuration_mode = false;
 static unsigned long s_wifi_config_start_time = 0;
 
@@ -232,7 +217,7 @@ static bool espnow_send_data(void)
 {
     if (!s_paired || !s_espnow_ready) return false;
 
-    uint8_t buf[ESPNOW_HEADER_FIXED_SIZE + sizeof(payload_dht_gas_t) + 4];
+    uint8_t buf[ESPNOW_HEADER_FIXED_SIZE + sizeof(payload_rain_t) + 4];
     memset(buf, 0, sizeof(buf));
 
     espnow_header_t *hdr = (espnow_header_t *)buf;
@@ -240,23 +225,21 @@ static bool espnow_send_data(void)
     hdr->msg_type = ESPNOW_MSG_SENSOR_DATA;
     hdr->sequence = s_sequence++;
     WiFi.macAddress(hdr->sensor_mac);
-    hdr->sensor_type = SENSOR_TYPE_DHT_GAS;
+    hdr->sensor_type = SENSOR_TYPE_RAIN;
     hdr->battery_pct = (uint8_t)s_battery;
     hdr->rssi = (int16_t)WiFi.RSSI();
 
-    payload_dht_gas_t *pl = (payload_dht_gas_t *)hdr->payload;
-    pl->temperature = s_temperature;
-    pl->humidity = s_humidity;
-    pl->gas_level = (uint16_t)s_gas_level;
-    pl->alarm = s_alarm ? 1 : 0;
+    payload_rain_t *pl = (payload_rain_t *)hdr->payload;
+    pl->rain_level = (uint8_t)s_rain_level;
+    pl->rain_digital = (uint8_t)s_rain_digital;
 
     IPAddress ip = WiFi.localIP();
-    uint8_t *ip_ptr = hdr->payload + sizeof(payload_dht_gas_t);
+    uint8_t *ip_ptr = hdr->payload + sizeof(payload_rain_t);
     ip_ptr[0] = ip[0];
     ip_ptr[1] = ip[1];
     ip_ptr[2] = ip[2];
     ip_ptr[3] = ip[3];
-    hdr->payload_len = sizeof(payload_dht_gas_t) + 4;
+    hdr->payload_len = sizeof(payload_rain_t) + 4;
 
     if (!espnow_add_peer(s_gateway_mac))
     {
@@ -288,7 +271,7 @@ static bool espnow_send_heartbeat(void)
     hdr->msg_type = ESPNOW_MSG_HEARTBEAT;
     hdr->sequence = s_sequence++;
     WiFi.macAddress(hdr->sensor_mac);
-    hdr->sensor_type = SENSOR_TYPE_DHT_GAS;
+    hdr->sensor_type = SENSOR_TYPE_RAIN;
     hdr->battery_pct = (uint8_t)s_battery;
     hdr->rssi = (int16_t)WiFi.RSSI();
     hdr->payload_len = 0;
@@ -310,7 +293,7 @@ static bool espnow_send_pair_request(void)
     req->msg_type = ESPNOW_MSG_PAIR_REQUEST;
     req->sequence = s_sequence++;
     WiFi.macAddress(req->sensor_mac);
-    req->sensor_type = SENSOR_TYPE_DHT_GAS;
+    req->sensor_type = SENSOR_TYPE_RAIN;
     uint32_t ver = 0x000A000B;
     req->firmware_version[0] = (uint8_t)(ver >> 24);
     req->firmware_version[1] = (uint8_t)(ver >> 16);
@@ -331,34 +314,12 @@ static bool espnow_send_pair_request(void)
     return true;
 }
 
-static void read_sensors(void)
+static void read_sensor(void)
 {
-    float temp = s_dht->readTemperature();
-    float hum = s_dht->readHumidity();
-    if (!isnan(temp) && !isnan(hum))
-    {
-        s_temperature = temp;
-        s_humidity = hum;
-        s_dht_valid = true;
-    }
-    else
-    {
-        s_dht_valid = false;
-        s_temperature += (random(-10, 10) / 20.0);
-        s_humidity += (random(-20, 20) / 10.0);
-        if (s_temperature < 18.0) s_temperature = 18.0;
-        if (s_temperature > 30.0) s_temperature = 30.0;
-        if (s_humidity < 30.0) s_humidity = 30.0;
-        if (s_humidity > 70.0) s_humidity = 70.0;
-    }
-
-    int raw = analogRead(GAS_ANALOG_PIN);
-    s_sensor_error = (raw == 0 || raw == 1024);
-    s_gas_level = constrain(map(raw, 0, 1024, 0, 100), 0, 100);
-
-    bool alarm = (s_gas_level >= GAS_ALARM_THRESHOLD);
-    bool alert = (s_gas_level >= GAS_ALERT_THRESHOLD && s_gas_level < GAS_ALARM_THRESHOLD);
-    s_alarm = alarm || alert;
+    int raw = analogRead(RAIN_ANALOG_PIN);
+    s_rain_level = map(raw, 0, 1024, 100, 0);
+    s_rain_level = constrain(s_rain_level, 0, 100);
+    s_rain_digital = digitalRead(RAIN_DIGITAL_PIN);
 
     static int counter = 0;
     counter++;
@@ -369,43 +330,10 @@ static void read_sensors(void)
     }
 }
 
-static int detect_dht_pin(void)
-{
-    const int candidates[] = {DHT_PIN, 4, 12, 13, 14, 0, 2, 15};
-    Serial.printf("[%s] Detectando pino do DHT22...\n", TAG);
-    for (int i = 0; i < (int)(sizeof(candidates) / sizeof(candidates[0])); i++)
-    {
-        int pin = candidates[i];
-        pinMode(pin, INPUT_PULLUP);
-        DHT dht(pin, DHT_TYPE);
-        dht.begin();
-        delay(250);
-        float t = dht.readTemperature();
-        float h = dht.readHumidity();
-        if (!isnan(t) && !isnan(h))
-        {
-            Serial.printf("[%s] DHT22 encontrado no GPIO %d (T=%.1f H=%.1f)\n", TAG, pin, t, h);
-            return pin;
-        }
-    }
-    Serial.printf("[%s] DHT22 nao encontrado, usando GPIO %d\n", TAG, DHT_PIN);
-    return DHT_PIN;
-}
-
 static void init_hardware(void)
 {
-    s_dht_pin = detect_dht_pin();
-    s_dht = new DHT(s_dht_pin, DHT_TYPE);
-    s_dht->begin();
-
-    pinMode(GAS_ANALOG_PIN, INPUT);
-
-    pinMode(GAS_LED_ALERT_PIN, OUTPUT);
-    digitalWrite(GAS_LED_ALERT_PIN, LOW);
-
-    pinMode(GAS_LED_ALARM_PIN, OUTPUT);
-    digitalWrite(GAS_LED_ALARM_PIN, LOW);
-
+    pinMode(RAIN_ANALOG_PIN, INPUT);
+    pinMode(RAIN_DIGITAL_PIN, INPUT);
 #ifdef LED_PIN
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
@@ -505,15 +433,9 @@ static void handle_api_state(void)
     String json;
     {
         JsonDocument doc;
-        if (s_dht_valid) {
-            doc["temperature"] = s_temperature;
-            doc["humidity"] = s_humidity;
-        }
-        doc["gas_level"] = s_gas_level;
-        doc["alarm"] = s_alarm;
+        doc["rain_level"] = s_rain_level;
+        doc["rain_digital"] = s_rain_digital == LOW;
         doc["battery"] = s_battery;
-        doc["dht_pin"] = s_dht_pin;
-        doc["dht_valid"] = s_dht_valid;
         doc["device_id"] = s_device_id;
         doc["device_name"] = s_device_name;
         doc["gateway_connected"] = s_gateway_connected;
@@ -522,16 +444,6 @@ static void handle_api_state(void)
         doc["rssi"] = WiFi.RSSI();
         doc["uptime_s"] = (millis() - s_start_time) / 1000;
         if (s_last_send_ms) doc["last_send_s"] = (millis() - s_last_send_ms) / 1000;
-        doc["gas_analog_pin"] = GAS_ANALOG_PIN;
-        doc["gas_digital_pin"] = GAS_DIGITAL_PIN;
-        doc["led_pin"] = LED_PIN;
-        doc["gas_led_alert_pin"] = GAS_LED_ALERT_PIN;
-        doc["gas_led_alarm_pin"] = GAS_LED_ALARM_PIN;
-        doc["raw_analog"] = analogRead(GAS_ANALOG_PIN);
-        doc["gas_digital"] = digitalRead(GAS_DIGITAL_PIN);
-        doc["led_state"] = digitalRead(LED_PIN);
-        doc["alert_led_state"] = digitalRead(GAS_LED_ALERT_PIN);
-        doc["alarm_led_state"] = digitalRead(GAS_LED_ALARM_PIN);
         doc["slot"] = s_assigned_slot;
         serializeJson(doc, json);
     }
@@ -601,13 +513,10 @@ static void handle_serial(void)
     case 'L':
     {
         Serial.printf("\n--- Leitura forcada ---\n");
-        read_sensors();
-        Serial.printf("  Temperatura: %.1f C%s\n", s_temperature, s_dht_valid ? "" : " (invalido)");
-        Serial.printf("  Umidade:     %.1f %%\n", s_humidity);
-        Serial.printf("  Gas:         %d %%\n", s_gas_level);
-        Serial.printf("  Alarme:      %s\n", s_alarm ? "SIM - VAZAMENTO!" : "Seguro");
-        Serial.printf("  DHT22:       GPIO %d\n", s_dht_pin);
-        Serial.printf("  Bateria:     %d %%\n", s_battery);
+        read_sensor();
+        Serial.printf("  Chuva:    %d %%\n", s_rain_level);
+        Serial.printf("  Digital:  %s\n", s_rain_digital == LOW ? "chuva" : "seco");
+        Serial.printf("  Bateria:  %d %%\n", s_battery);
         if (s_paired)
         {
             s_last_espnow_send = 0;
@@ -618,7 +527,7 @@ static void handle_serial(void)
         {
             Serial.printf("  (gateway nao pareado)\n");
         }
-        Serial.printf("-----------------------------\n\n");
+        Serial.printf("-------------------------\n\n");
         break;
     }
     case 'u':
@@ -632,18 +541,6 @@ static void handle_serial(void)
         Serial.printf("    espota.py -i %s.local -p 8266 -f firmware.bin\n", s_device_id);
         Serial.printf("-------------\n\n");
         break;
-    case 't':
-    case 'T':
-    {
-        Serial.printf("\n--- Teste de pinos DHT22 ---\n");
-        int pin = detect_dht_pin();
-        if (pin >= 0)
-            Serial.printf("  => DHT22 no GPIO %d\n", pin);
-        else
-            Serial.printf("  => DHT22 nao encontrado\n");
-        Serial.printf("----------------------------\n\n");
-        break;
-    }
     case 'p':
     case 'P':
     {
@@ -652,11 +549,11 @@ static void handle_serial(void)
         s_gateway_connected = false;
         s_pair_attempts = 0;
         Serial.printf("  Estado de pareamento resetado\n");
-        Serial.printf("  Enviando requisição de par...\n");
+        Serial.printf("  Enviando requisicao de par...\n");
         if (espnow_send_pair_request())
-            Serial.printf("  Requisição enviada!\n");
+            Serial.printf("  Requisicao enviada!\n");
         else
-            Serial.printf("  Falha ao enviar requisição\n");
+            Serial.printf("  Falha ao enviar requisicao\n");
         Serial.printf("----------------\n\n");
         break;
     }
@@ -664,10 +561,9 @@ static void handle_serial(void)
     case 'H':
     case '?':
         Serial.printf("\n--- Comandos ---\n");
-        Serial.printf("  l    - ler sensores agora\n");
+        Serial.printf("  l    - ler sensor agora\n");
         Serial.printf("  r    - reset\n");
         Serial.printf("  s    - status do dispositivo\n");
-        Serial.printf("  t    - testar pinos do DHT22\n");
         Serial.printf("  p    - resetar par e tentar parear\n");
         Serial.printf("  u    - info OTA\n");
         Serial.printf("  h/?  - esta ajuda\n");
@@ -690,10 +586,8 @@ static void handle_serial(void)
         Serial.printf("\n--- Status ---\n");
         Serial.printf("  Dispositivo: %s\n", s_device_id);
         Serial.printf("  Nome:        %s\n", s_device_name);
-        Serial.printf("  Temperatura: %.1f C%s\n", s_temperature, s_dht_valid ? "" : " (invalido)");
-        Serial.printf("  Umidade:     %.1f %%\n", s_humidity);
-        Serial.printf("  Gas:         %d %%\n", s_gas_level);
-        Serial.printf("  Alarme:      %s\n", s_alarm ? "SIM" : "nao");
+        Serial.printf("  Chuva:       %d %%\n", s_rain_level);
+        Serial.printf("  Digital:     %s\n", s_rain_digital == LOW ? "chuva" : "seco");
         Serial.printf("  Bateria:     %d %%\n", s_battery);
         if (s_paired)
         {
@@ -765,7 +659,7 @@ void setup(void)
 
     Serial.printf("\n");
     Serial.printf("============================================\n");
-    Serial.printf("  ESP8266 DHT22 + MQ-2 " FW_VERSION "\n");
+    Serial.printf("  ESP8266 Rain Sensor " FW_VERSION "\n");
     Serial.printf("  Device: %s\n", s_device_id);
     Serial.printf("  Nome:   %s\n", s_device_name);
     Serial.printf("============================================\n");
@@ -839,7 +733,7 @@ void loop(void)
     if (now - s_last_sensor_read > STATE_UPDATE_INTERVAL)
     {
         s_last_sensor_read = now;
-        read_sensors();
+        read_sensor();
     }
 
     if (!s_paired)
@@ -921,8 +815,7 @@ void loop(void)
             espnow_send_heartbeat();
     }
 
-    // LED status
-    #ifdef LED_PIN
+#ifdef LED_PIN
     static unsigned long last_led = 0;
     if (s_wifi_configuration_mode)
     {
@@ -948,45 +841,7 @@ void loop(void)
     {
         digitalWrite(LED_PIN, LOW);
     }
-    #endif
-
-    // Gas alert LED
-    #ifdef GAS_LED_ALERT_PIN
-    if (!s_sensor_error && s_gas_level < GAS_ALERT_THRESHOLD)
-    {
-        digitalWrite(GAS_LED_ALERT_PIN, LOW);
-    }
-    else if (s_gas_level >= GAS_ALERT_THRESHOLD && s_gas_level < GAS_ALARM_THRESHOLD)
-    {
-        static unsigned long last_alert = 0;
-        if (now - last_alert >= ALARM_BLINK_SLOW_MS)
-        {
-            last_alert = now;
-            digitalWrite(GAS_LED_ALERT_PIN, !digitalRead(GAS_LED_ALERT_PIN));
-        }
-    }
-    else if (s_gas_level >= GAS_ALARM_THRESHOLD)
-    {
-        digitalWrite(GAS_LED_ALERT_PIN, HIGH);
-    }
-    #endif
-
-    // Gas alarm LED
-    #ifdef GAS_LED_ALARM_PIN
-    static unsigned long last_alarm_led = 0;
-    if (s_gas_level >= GAS_ALARM_THRESHOLD)
-    {
-        if (now - last_alarm_led >= ALARM_BLINK_FAST_MS)
-        {
-            last_alarm_led = now;
-            digitalWrite(GAS_LED_ALARM_PIN, !digitalRead(GAS_LED_ALARM_PIN));
-        }
-    }
-    else
-    {
-        digitalWrite(GAS_LED_ALARM_PIN, LOW);
-    }
-    #endif
+#endif
 
     delay(1);
 }
